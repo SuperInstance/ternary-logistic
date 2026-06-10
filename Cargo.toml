@@ -1,4 +1,6 @@
 [package]
+description = "ternary-logistic - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/ternary-logistic"
 name = "ternary-logistic"
 version = "0.1.0"
 edition = "2024"
