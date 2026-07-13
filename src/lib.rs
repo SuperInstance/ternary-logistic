@@ -5,7 +5,6 @@
 //!
 //! Supports L2 regularization, gradient-based optimization, and probability prediction.
 
-
 /// Sigmoid function: σ(z) = 1 / (1 + exp(-z))
 pub fn sigmoid(z: f64) -> f64 {
     if z >= 0.0 {
@@ -122,8 +121,8 @@ impl BinaryLogisticRegression {
         }
 
         // Average and add L2 regularization
-        for j in 0..d {
-            grad_w[j] = grad_w[j] / n + self.config.l2_penalty * self.weights[j];
+        for (grad, &w) in grad_w.iter_mut().zip(&self.weights) {
+            *grad = *grad / n + self.config.l2_penalty * w;
         }
         grad_b /= n;
 
@@ -135,7 +134,7 @@ impl BinaryLogisticRegression {
         let n = x.len() as f64;
         let mut loss = 0.0;
         for (xi, &yi) in x.iter().zip(y.iter()) {
-            let p = self.predict_proba(xi).max(1e-15).min(1.0 - 1e-15);
+            let p = self.predict_proba(xi).clamp(1e-15, 1.0 - 1e-15);
             let yi_f = yi as f64;
             loss += -(yi_f * p.ln() + (1.0 - yi_f) * (1.0 - p).ln());
         }
@@ -153,8 +152,8 @@ impl BinaryLogisticRegression {
             let (grad_w, grad_b) = self.compute_gradients(x, y);
 
             let lr = self.config.learning_rate;
-            for j in 0..self.weights.len() {
-                self.weights[j] -= lr * grad_w[j];
+            for (w, &grad) in self.weights.iter_mut().zip(&grad_w) {
+                *w -= lr * grad;
             }
             self.bias -= lr * grad_b;
         }
@@ -262,8 +261,8 @@ impl TernaryLogisticRegression {
             let lr = self.config.learning_rate;
             let n_f = n as f64;
             for k in 0..self.n_classes {
-                for j in 0..d {
-                    self.weights[k][j] -= lr * (grad_w[k][j] / n_f + self.config.l2_penalty * self.weights[k][j]);
+                for (w, &grad) in self.weights[k].iter_mut().zip(&grad_w[k]) {
+                    *w -= lr * (grad / n_f + self.config.l2_penalty * *w);
                 }
                 self.biases[k] -= lr * grad_b[k] / n_f;
             }
@@ -382,7 +381,7 @@ mod tests {
         let model = BinaryLogisticRegression::new(2);
         let x = vec![1, -1];
         let p = model.predict_proba(&x);
-        assert!(p >= 0.0 && p <= 1.0);
+        assert!((0.0..=1.0).contains(&p));
     }
 
     #[test]
@@ -392,10 +391,10 @@ mod tests {
             vec![-1, -1], // class 0
             vec![-1, 0],
             vec![0, -1],
-            vec![0, 0],   // class 1
+            vec![0, 0], // class 1
             vec![0, 1],
             vec![1, 0],
-            vec![1, 1],   // class 2
+            vec![1, 1], // class 2
             vec![1, 0],
         ];
         let y: Vec<usize> = vec![0, 0, 0, 1, 1, 1, 2, 2];
@@ -427,9 +426,7 @@ mod tests {
 
     #[test]
     fn test_regularization_reduces_weight_magnitude() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![-1], vec![1], vec![-1], vec![1], vec![-1], vec![1],
-        ];
+        let x: Vec<Vec<i8>> = vec![vec![-1], vec![1], vec![-1], vec![1], vec![-1], vec![1]];
         let y: Vec<u8> = vec![0, 1, 0, 1, 0, 1];
 
         let mut model_no_reg = BinaryLogisticRegression::with_config(
@@ -488,6 +485,9 @@ mod tests {
         model.weights = vec![1.0, -1.0];
         model.bias = 0.5;
         let z = model.linear_predict(&[1, -1]);
-        assert!((z - 2.5).abs() < 1e-10, "w·x + b = 1*1 + (-1)*(-1) + 0.5 = 2.5");
+        assert!(
+            (z - 2.5).abs() < 1e-10,
+            "w·x + b = 1*1 + (-1)*(-1) + 0.5 = 2.5"
+        );
     }
 }
