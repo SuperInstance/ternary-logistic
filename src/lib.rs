@@ -426,16 +426,26 @@ mod tests {
 
     #[test]
     fn test_regularization_reduces_weight_magnitude() {
+        // Same learning_rate and max_iter for both models — ONLY l2_penalty differs.
+        // The previous version used lr=0.01 for the regularized model and lr=0.5 for
+        // the unregularized one, so the test passed even with L2 completely removed
+        // (the 50× smaller learning rate alone produced smaller weights). Now the
+        // learning rate is identical, so this truly tests the regularization term.
         let x: Vec<Vec<i8>> = vec![vec![-1], vec![1], vec![-1], vec![1], vec![-1], vec![1]];
         let y: Vec<u8> = vec![0, 1, 0, 1, 0, 1];
+
+        let base = LogisticConfig {
+            learning_rate: 0.5,
+            max_iter: 1000,
+            l2_penalty: 0.0, // overridden below
+            tol: 1e-10,
+        };
 
         let mut model_no_reg = BinaryLogisticRegression::with_config(
             1,
             LogisticConfig {
-                learning_rate: 0.5,
-                max_iter: 1000,
                 l2_penalty: 0.0,
-                tol: 1e-10,
+                ..base.clone()
             },
         );
         model_no_reg.fit(&x, &y);
@@ -443,10 +453,8 @@ mod tests {
         let mut model_reg = BinaryLogisticRegression::with_config(
             1,
             LogisticConfig {
-                learning_rate: 0.01,
-                max_iter: 2000,
                 l2_penalty: 1.0,
-                tol: 1e-10,
+                ..base
             },
         );
         model_reg.fit(&x, &y);
@@ -489,5 +497,172 @@ mod tests {
             (z - 2.5).abs() < 1e-10,
             "w·x + b = 1*1 + (-1)*(-1) + 0.5 = 2.5"
         );
+    }
+
+    // ── Hand-verified correctness tests ──────────────────────────────────
+    // Each of these checks a specific numerical value derived independently
+    // by hand, not just a range or sign. If the underlying math is wrong,
+    // these tests will fail with a concrete expected-vs-actual mismatch.
+
+    #[test]
+    fn test_sigmoid_known_values() {
+        // σ(0) = 1/(1+e^0) = 1/2 = 0.5
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-12);
+        // σ(1) = 1/(1+e^{-1}) = 1/(1+0.3678794...) ≈ 0.7310585786
+        assert!((sigmoid(1.0) - 0.7310585786300209).abs() < 1e-10);
+        // σ(-1) = 1/(1+e^{1}) ≈ 0.2689414213699791
+        assert!((sigmoid(-1.0) - 0.2689414213699791).abs() < 1e-10);
+        // Symmetry: σ(z) + σ(-z) = 1
+        for z in [0.5, 2.0, 5.0, 50.0] {
+            assert!((sigmoid(z) + sigmoid(-z) - 1.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_softmax_known_values() {
+        // softmax([1,2,3]):
+        //   max=3, shifted=[-2,-1,0]
+        //   exps=[e^{-2}, e^{-1}, 1] = [0.1353353, 0.3678794, 1.0]
+        //   sum = 1.5032147
+        //   probs = [0.0900306, 0.2447285, 0.6652409]
+        let probs = softmax(&[1.0, 2.0, 3.0]);
+        assert!((probs[0] - 0.09003057317038038).abs() < 1e-10);
+        assert!((probs[1] - 0.24472847105479767).abs() < 1e-10);
+        assert!((probs[2] - 0.6652409557748218).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gradient_descent_step() {
+        // Independently verified one-step gradient descent:
+        //   1 feature, 2 samples: x=[1]→y=1, x=[-1]→y=0
+        //   Initial: w=0, b=0, lr=0.5, l2=0
+        //
+        //   Predictions: both linear_predict=0, so pred=sigmoid(0)=0.5
+        //   Sample 1: error = 0.5−1 = −0.5; grad_w += −0.5·1 = −0.5; grad_b += −0.5
+        //   Sample 2: error = 0.5−0 = +0.5; grad_w += 0.5·(−1) = −0.5; grad_b += +0.5
+        //   Average:  grad_w = (−0.5−0.5)/2 = −0.5;  grad_b = (−0.5+0.5)/2 = 0
+        //   Update:   w = 0 − 0.5·(−0.5) = 0.25;     b = 0 − 0.5·0 = 0
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 1,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        let x = vec![vec![1], vec![-1]];
+        let y = vec![1u8, 0u8];
+        model.fit(&x, &y);
+        assert!(
+            (model.weights[0] - 0.25).abs() < 1e-12,
+            "w = {}",
+            model.weights[0]
+        );
+        assert!(model.bias.abs() < 1e-12, "b = {}", model.bias);
+    }
+
+    #[test]
+    fn test_log_loss_known_value() {
+        // With w=0, b=0: predict_proba = sigmoid(0) = 0.5 for all samples.
+        // For any y: loss = -(y·ln(0.5) + (1−y)·ln(0.5)) = −ln(0.5) = ln(2).
+        // Average over samples = ln(2) ≈ 0.6931471805599453.
+        let model = BinaryLogisticRegression::new(1);
+        let x = vec![vec![1], vec![-1]];
+        let y = vec![1u8, 0u8];
+        let loss = model.log_loss(&x, &y);
+        assert!(
+            (loss - std::f64::consts::LN_2).abs() < 1e-12,
+            "loss = {}, expected ln(2)",
+            loss
+        );
+    }
+
+    // ── Edge-case coverage for real branches of logic ────────────────────
+
+    #[test]
+    fn test_binary_perfectly_separable() {
+        // Perfectly separable 1D data: x<0 → class 0, x>0 → class 1.
+        // With enough iterations the model should classify all correctly.
+        let x: Vec<Vec<i8>> = vec![vec![-1], vec![-1], vec![1], vec![1]];
+        let y: Vec<u8> = vec![0, 0, 1, 1];
+
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 2000,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        model.fit(&x, &y);
+        let acc = model.accuracy(&x, &y);
+        assert_eq!(
+            acc, 1.0,
+            "Perfectly separable data should reach 100% accuracy"
+        );
+        // On unseen points the decision boundary is still correct.
+        assert_eq!(model.predict(&[-1]), 0);
+        assert_eq!(model.predict(&[1]), 1);
+    }
+
+    #[test]
+    fn test_binary_all_same_class() {
+        // All samples are class 1 — the model should train without panicking
+        // and predict class 1 everywhere (bias grows positive).
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0]];
+        let y: Vec<u8> = vec![1, 1, 1];
+
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 500,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        model.fit(&x, &y);
+        for xi in &x {
+            assert_eq!(model.predict(xi), 1, "Should predict class 1 for all");
+        }
+    }
+
+    #[test]
+    fn test_binary_single_sample() {
+        // Training on a single sample should not crash (n=1, no division issues).
+        let x: Vec<Vec<i8>> = vec![vec![1, 1]];
+        let y: Vec<u8> = vec![1];
+
+        let mut model = BinaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        let loss = model.log_loss(&x, &y);
+        assert!(loss.is_finite(), "Loss should be finite for single sample");
+    }
+
+    #[test]
+    fn test_ternary_all_same_class() {
+        // All samples are class 1 — should train without panicking.
+        let x: Vec<Vec<i8>> = vec![vec![1, 0], vec![-1, 1], vec![0, -1]];
+        let y: Vec<usize> = vec![1, 1, 1];
+
+        let mut model = TernaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        for xi in &x {
+            assert_eq!(model.predict(xi), 1, "Should predict class 1 for all");
+        }
+    }
+
+    #[test]
+    fn test_ternary_single_sample() {
+        // Single sample in multinomial — should not crash.
+        let x: Vec<Vec<i8>> = vec![vec![1, 1]];
+        let y: Vec<usize> = vec![2];
+
+        let mut model = TernaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        let loss = model.cross_entropy_loss(&x, &y);
+        assert!(loss.is_finite(), "Loss should be finite for single sample");
     }
 }
