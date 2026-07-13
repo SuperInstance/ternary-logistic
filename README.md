@@ -183,7 +183,7 @@ ternary_logistic
 | Mini-batch SGD | Not implemented |
 | Newton's method / IRLS | Not implemented |
 | K > 3 classes | Not supported |
-| MSRV | Edition 2024 |
+| MSRV | Edition 2021 |
 
 **Known limitations:** The optimizer doesn't use the convergence tolerance for early stopping — it always runs `max_iter` iterations. For the multinomial model, classes are fixed at 3. Learning rate tuning is manual; no line search or adaptive rates.
 
