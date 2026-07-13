@@ -2,6 +2,16 @@
 
 Logistic regression where every feature is {−1, 0, +1}.
 
+## When to use this
+
+Use this crate when your features are already ternary-valued (`{-1, 0, +1}`) and you need **calibrated probabilities**, not just labels. Common scenarios:
+
+- **Ternary neural networks** — classify samples by their quantized weight activations.
+- **Balanced-ternary encodings** — hash codes, feature fingerprints, or signal quantization.
+- **Ternary hash codes** — similarity-based retrieval where you need a probability head.
+
+Because every feature shares the same bounded range, you get **no scaling needed, no one-hot encoding, and forgiving learning rates**. For continuous targets use [ternary-regression](https://github.com/SuperInstance/ternary-regression); for clustering before classification use [ternary-em](https://github.com/SuperInstance/ternary-em).
+
 ## The Problem
 
 You need to classify data with ternary features — quantized weights, ternary hash codes, balanced ternary encodings — and you need calibrated probabilities, not just labels. Standard logistic regression works, but it carries baggage: feature scaling, one-hot encoding for categoricals, learning rate schedules designed for continuous inputs. With ternary features, none of that applies.
@@ -84,8 +94,8 @@ let mut model = BinaryLogisticRegression::with_config(2, LogisticConfig {
 });
 model.fit(&x, &y);
 
-let prob = model.predict_proba(&vec![1, 1]);   // P(Y=1|x) → near 1.0
-let label = model.predict(&vec![-1, -1]);       // → 0
+let prob = model.predict_proba(&[1, 1]);   // P(Y=1|x) → near 1.0
+let label = model.predict(&[-1, -1]);       // → 0
 let loss = model.log_loss(&x, &y);             // negative log-likelihood + L2
 let acc = model.accuracy(&x, &y);
 ```
@@ -110,8 +120,8 @@ let mut model = TernaryLogisticRegression::with_config(2, LogisticConfig {
 });
 model.fit(&x, &y);
 
-let probs = model.predict_proba(&vec![1, 1]);  // [P(0), P(1), P(2)] → sum to 1.0
-let class = model.predict(&vec![-1, -1]);       // → 0
+let probs = model.predict_proba(&[1, 1]);  // [P(0), P(1), P(2)] → sum to 1.0
+let class = model.predict(&[-1, -1]);       // → 0
 let ce = model.cross_entropy_loss(&x, &y);     // cross-entropy
 ```
 
