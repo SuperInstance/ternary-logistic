@@ -4,9 +4,26 @@
 //! and binary or multinomial (3-class) outcomes.
 //!
 //! Supports L2 regularization, gradient-based optimization, and probability prediction.
+//!
+//! ## When to use this crate
+//!
+//! Use this when your features are already quantized to `{-1, 0, +1}` (e.g. ternary
+//! neural-network weights, balanced-ternary encodings, ternary hash codes) and you
+//! need calibrated probabilities — not just argmax labels. Because every feature has
+//! the same bounded range, no scaling or one-hot encoding is needed, and the
+//! gradient structure allows larger learning rates than general-purpose libraries.
+//!
+//! Part of the [SuperInstance ternary ecosystem](https://github.com/SuperInstance):
+//! use [`ternary-regression`](https://github.com/SuperInstance/ternary-regression) for
+//! continuous targets, [`ternary-em`](https://github.com/SuperInstance/ternary-em) for
+//! clustering before classification, and this crate for the logistic head.
 
-
-/// Sigmoid function: σ(z) = 1 / (1 + exp(-z))
+/// Numerically stable logistic sigmoid: `σ(z) = 1 / (1 + e⁻ᶻ)`.
+///
+/// Always returns a value in `(0, 1)`, never NaN or infinity for finite inputs.
+/// Uses a split formulation to avoid `exp()` overflow:
+/// - `z ≥ 0`: compute `1 / (1 + e⁻ᶻ)` (the exponent is ≤ 0, no overflow)
+/// - `z < 0`: compute `eᶻ / (1 + eᶻ)` (the exponent is < 0, no overflow)
 pub fn sigmoid(z: f64) -> f64 {
     if z >= 0.0 {
         1.0 / (1.0 + (-z).exp())
@@ -16,8 +33,10 @@ pub fn sigmoid(z: f64) -> f64 {
     }
 }
 
-/// Softmax function for a vector of logits.
-/// Returns probabilities that sum to 1.0.
+/// Numerically stable softmax over a slice of logits.
+///
+/// Subtracts the maximum logit before exponentiating so that no intermediate
+/// value overflows. Returns a probability vector that sums to 1.0.
 pub fn softmax(logits: &[f64]) -> Vec<f64> {
     let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let exps: Vec<f64> = logits.iter().map(|&z| (z - max).exp()).collect();
@@ -25,16 +44,25 @@ pub fn softmax(logits: &[f64]) -> Vec<f64> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
-/// Configuration for logistic regression training.
+/// Hyperparameters for gradient-descent training.
+///
+/// Use [`LogisticConfig::default()`] for sensible defaults, or construct
+/// manually and pass to [`BinaryLogisticRegression::with_config`] /
+/// [`TernaryLogisticRegression::with_config`].
 #[derive(Debug, Clone)]
 pub struct LogisticConfig {
-    /// Learning rate for gradient descent.
+    /// Step size for each gradient-descent update.
     pub learning_rate: f64,
-    /// Number of training iterations.
+    /// Number of full-batch gradient-descent iterations to run.
     pub max_iter: usize,
-    /// L2 regularization strength (lambda).
+    /// L2 regularization strength λ. Added as `λ · wⱼ` to each weight gradient.
+    /// Set to `0.0` for no regularization.
     pub l2_penalty: f64,
-    /// Convergence tolerance on parameter change.
+    /// Convergence tolerance.
+    ///
+    /// **Note:** this field is accepted for API compatibility but is currently
+    /// *not* checked during fitting — the solver always runs exactly `max_iter`
+    /// iterations. See the README "Design Decisions" section for rationale.
     pub tol: f64,
 }
 
@@ -62,7 +90,7 @@ pub struct BinaryLogisticRegression {
 }
 
 impl BinaryLogisticRegression {
-    /// Create a new model with zero-initialized weights of dimension `d`.
+    /// Construct a model with `d` zero-initialized weights and default hyperparameters.
     pub fn new(d: usize) -> Self {
         BinaryLogisticRegression {
             weights: vec![0.0; d],
@@ -71,7 +99,7 @@ impl BinaryLogisticRegression {
         }
     }
 
-    /// Create with custom config.
+    /// Construct a model with `d` zero-initialized weights and the given hyperparameters.
     pub fn with_config(d: usize, config: LogisticConfig) -> Self {
         BinaryLogisticRegression {
             weights: vec![0.0; d],
@@ -80,7 +108,9 @@ impl BinaryLogisticRegression {
         }
     }
 
-    /// Compute the linear combination w·x + b.
+    /// Raw linear score `w·x + b` before applying the sigmoid.
+    ///
+    /// `x` must have the same length as the model's weight vector.
     pub fn linear_predict(&self, x: &[i8]) -> f64 {
         assert_eq!(x.len(), self.weights.len());
         self.weights
@@ -96,7 +126,7 @@ impl BinaryLogisticRegression {
         sigmoid(self.linear_predict(x))
     }
 
-    /// Predict class label (0 or 1).
+    /// Predict the class label: `1` if `P(Y=1|x) ≥ 0.5`, otherwise `0`.
     pub fn predict(&self, x: &[i8]) -> u8 {
         if self.predict_proba(x) >= 0.5 {
             1
@@ -122,20 +152,22 @@ impl BinaryLogisticRegression {
         }
 
         // Average and add L2 regularization
-        for j in 0..d {
-            grad_w[j] = grad_w[j] / n + self.config.l2_penalty * self.weights[j];
+        for (grad, &w) in grad_w.iter_mut().zip(&self.weights) {
+            *grad = *grad / n + self.config.l2_penalty * w;
         }
         grad_b /= n;
 
         (grad_w, grad_b)
     }
 
-    /// Compute the log-loss (negative log-likelihood + L2).
+    /// Mean binary cross-entropy (negative log-likelihood) plus the L2 penalty term.
+    ///
+    /// Probabilities are clamped to `[1e-15, 1−1e-15]` to avoid `ln(0)`.
     pub fn log_loss(&self, x: &[Vec<i8>], y: &[u8]) -> f64 {
         let n = x.len() as f64;
         let mut loss = 0.0;
         for (xi, &yi) in x.iter().zip(y.iter()) {
-            let p = self.predict_proba(xi).max(1e-15).min(1.0 - 1e-15);
+            let p = self.predict_proba(xi).clamp(1e-15, 1.0 - 1e-15);
             let yi_f = yi as f64;
             loss += -(yi_f * p.ln() + (1.0 - yi_f) * (1.0 - p).ln());
         }
@@ -146,21 +178,23 @@ impl BinaryLogisticRegression {
         loss
     }
 
-    /// Fit the model using gradient descent.
+    /// Train weights and bias via full-batch gradient descent on `(x, y)`.
+    ///
+    /// Runs exactly `max_iter` iterations (no early stopping).
     pub fn fit(&mut self, x: &[Vec<i8>], y: &[u8]) {
         assert!(!x.is_empty());
         for _ in 0..self.config.max_iter {
             let (grad_w, grad_b) = self.compute_gradients(x, y);
 
             let lr = self.config.learning_rate;
-            for j in 0..self.weights.len() {
-                self.weights[j] -= lr * grad_w[j];
+            for (w, &grad) in self.weights.iter_mut().zip(&grad_w) {
+                *w -= lr * grad;
             }
             self.bias -= lr * grad_b;
         }
     }
 
-    /// Accuracy on given data.
+    /// Fraction of samples in `x` whose predicted label matches `y` (0.0–1.0).
     pub fn accuracy(&self, x: &[Vec<i8>], y: &[u8]) -> f64 {
         let correct = x
             .iter()
@@ -185,7 +219,7 @@ pub struct TernaryLogisticRegression {
 }
 
 impl TernaryLogisticRegression {
-    /// Create a new 3-class model with `d` features.
+    /// Construct a 3-class model with `d` zero-initialized features and default hyperparameters.
     pub fn new(d: usize) -> Self {
         let n_classes = 3;
         TernaryLogisticRegression {
@@ -196,7 +230,7 @@ impl TernaryLogisticRegression {
         }
     }
 
-    /// Create with custom config.
+    /// Construct a 3-class model with `d` zero-initialized features and the given hyperparameters.
     pub fn with_config(d: usize, config: LogisticConfig) -> Self {
         let n_classes = 3;
         TernaryLogisticRegression {
@@ -207,7 +241,7 @@ impl TernaryLogisticRegression {
         }
     }
 
-    /// Compute logits for each class.
+    /// Raw linear score `wₖ·x + bₖ` for each class `k ∈ {0,1,2}`.
     pub fn logits(&self, x: &[i8]) -> Vec<f64> {
         (0..self.n_classes)
             .map(|k| {
@@ -221,23 +255,25 @@ impl TernaryLogisticRegression {
             .collect()
     }
 
-    /// Predict class probabilities via softmax.
+    /// `[P(Y=0|x), P(Y=1|x), P(Y=2|x)]` via softmax over [`Self::logits`].
     pub fn predict_proba(&self, x: &[i8]) -> Vec<f64> {
         softmax(&self.logits(x))
     }
 
-    /// Predict the most likely class.
+    /// Return the index of the highest-probability class (the argmax of [`Self::predict_proba`]).
     pub fn predict(&self, x: &[i8]) -> usize {
         let logits = self.logits(x);
         logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .unwrap()
             .0
     }
 
-    /// Fit the model using gradient descent.
+    /// Train all weight vectors and biases via full-batch gradient descent on `(x, y)`.
+    ///
+    /// Runs exactly `max_iter` iterations (no early stopping).
     pub fn fit(&mut self, x: &[Vec<i8>], y: &[usize]) {
         assert!(!x.is_empty());
         let n = x.len();
@@ -262,15 +298,15 @@ impl TernaryLogisticRegression {
             let lr = self.config.learning_rate;
             let n_f = n as f64;
             for k in 0..self.n_classes {
-                for j in 0..d {
-                    self.weights[k][j] -= lr * (grad_w[k][j] / n_f + self.config.l2_penalty * self.weights[k][j]);
+                for (w, &grad) in self.weights[k].iter_mut().zip(&grad_w[k]) {
+                    *w -= lr * (grad / n_f + self.config.l2_penalty * *w);
                 }
                 self.biases[k] -= lr * grad_b[k] / n_f;
             }
         }
     }
 
-    /// Accuracy on given data.
+    /// Fraction of samples in `x` whose predicted class matches `y` (0.0–1.0).
     pub fn accuracy(&self, x: &[Vec<i8>], y: &[usize]) -> f64 {
         let correct = x
             .iter()
@@ -280,7 +316,9 @@ impl TernaryLogisticRegression {
         correct as f64 / x.len() as f64
     }
 
-    /// Cross-entropy loss.
+    /// Mean multinomial cross-entropy: `−ln P(Y=yᵢ|xᵢ)` averaged over samples.
+    ///
+    /// Probabilities are clamped to a minimum of `1e-15` to avoid `ln(0)`.
     pub fn cross_entropy_loss(&self, x: &[Vec<i8>], y: &[usize]) -> f64 {
         let n = x.len() as f64;
         let mut loss = 0.0;
@@ -382,7 +420,7 @@ mod tests {
         let model = BinaryLogisticRegression::new(2);
         let x = vec![1, -1];
         let p = model.predict_proba(&x);
-        assert!(p >= 0.0 && p <= 1.0);
+        assert!((0.0..=1.0).contains(&p));
     }
 
     #[test]
@@ -392,10 +430,10 @@ mod tests {
             vec![-1, -1], // class 0
             vec![-1, 0],
             vec![0, -1],
-            vec![0, 0],   // class 1
+            vec![0, 0], // class 1
             vec![0, 1],
             vec![1, 0],
-            vec![1, 1],   // class 2
+            vec![1, 1], // class 2
             vec![1, 0],
         ];
         let y: Vec<usize> = vec![0, 0, 0, 1, 1, 1, 2, 2];
@@ -427,18 +465,26 @@ mod tests {
 
     #[test]
     fn test_regularization_reduces_weight_magnitude() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![-1], vec![1], vec![-1], vec![1], vec![-1], vec![1],
-        ];
+        // Same learning_rate and max_iter for both models — ONLY l2_penalty differs.
+        // The previous version used lr=0.01 for the regularized model and lr=0.5 for
+        // the unregularized one, so the test passed even with L2 completely removed
+        // (the 50× smaller learning rate alone produced smaller weights). Now the
+        // learning rate is identical, so this truly tests the regularization term.
+        let x: Vec<Vec<i8>> = vec![vec![-1], vec![1], vec![-1], vec![1], vec![-1], vec![1]];
         let y: Vec<u8> = vec![0, 1, 0, 1, 0, 1];
+
+        let base = LogisticConfig {
+            learning_rate: 0.5,
+            max_iter: 1000,
+            l2_penalty: 0.0, // overridden below
+            tol: 1e-10,
+        };
 
         let mut model_no_reg = BinaryLogisticRegression::with_config(
             1,
             LogisticConfig {
-                learning_rate: 0.5,
-                max_iter: 1000,
                 l2_penalty: 0.0,
-                tol: 1e-10,
+                ..base.clone()
             },
         );
         model_no_reg.fit(&x, &y);
@@ -446,10 +492,8 @@ mod tests {
         let mut model_reg = BinaryLogisticRegression::with_config(
             1,
             LogisticConfig {
-                learning_rate: 0.01,
-                max_iter: 2000,
                 l2_penalty: 1.0,
-                tol: 1e-10,
+                ..base
             },
         );
         model_reg.fit(&x, &y);
@@ -488,6 +532,176 @@ mod tests {
         model.weights = vec![1.0, -1.0];
         model.bias = 0.5;
         let z = model.linear_predict(&[1, -1]);
-        assert!((z - 2.5).abs() < 1e-10, "w·x + b = 1*1 + (-1)*(-1) + 0.5 = 2.5");
+        assert!(
+            (z - 2.5).abs() < 1e-10,
+            "w·x + b = 1*1 + (-1)*(-1) + 0.5 = 2.5"
+        );
+    }
+
+    // ── Hand-verified correctness tests ──────────────────────────────────
+    // Each of these checks a specific numerical value derived independently
+    // by hand, not just a range or sign. If the underlying math is wrong,
+    // these tests will fail with a concrete expected-vs-actual mismatch.
+
+    #[test]
+    fn test_sigmoid_known_values() {
+        // σ(0) = 1/(1+e^0) = 1/2 = 0.5
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-12);
+        // σ(1) = 1/(1+e^{-1}) = 1/(1+0.3678794...) ≈ 0.7310585786
+        assert!((sigmoid(1.0) - 0.7310585786300209).abs() < 1e-10);
+        // σ(-1) = 1/(1+e^{1}) ≈ 0.2689414213699791
+        assert!((sigmoid(-1.0) - 0.2689414213699791).abs() < 1e-10);
+        // Symmetry: σ(z) + σ(-z) = 1
+        for z in [0.5, 2.0, 5.0, 50.0] {
+            assert!((sigmoid(z) + sigmoid(-z) - 1.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_softmax_known_values() {
+        // softmax([1,2,3]):
+        //   max=3, shifted=[-2,-1,0]
+        //   exps=[e^{-2}, e^{-1}, 1] = [0.1353353, 0.3678794, 1.0]
+        //   sum = 1.5032147
+        //   probs = [0.0900306, 0.2447285, 0.6652409]
+        let probs = softmax(&[1.0, 2.0, 3.0]);
+        assert!((probs[0] - 0.09003057317038038).abs() < 1e-10);
+        assert!((probs[1] - 0.24472847105479767).abs() < 1e-10);
+        assert!((probs[2] - 0.6652409557748218).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gradient_descent_step() {
+        // Independently verified one-step gradient descent:
+        //   1 feature, 2 samples: x=[1]→y=1, x=[-1]→y=0
+        //   Initial: w=0, b=0, lr=0.5, l2=0
+        //
+        //   Predictions: both linear_predict=0, so pred=sigmoid(0)=0.5
+        //   Sample 1: error = 0.5−1 = −0.5; grad_w += −0.5·1 = −0.5; grad_b += −0.5
+        //   Sample 2: error = 0.5−0 = +0.5; grad_w += 0.5·(−1) = −0.5; grad_b += +0.5
+        //   Average:  grad_w = (−0.5−0.5)/2 = −0.5;  grad_b = (−0.5+0.5)/2 = 0
+        //   Update:   w = 0 − 0.5·(−0.5) = 0.25;     b = 0 − 0.5·0 = 0
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 1,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        let x = vec![vec![1], vec![-1]];
+        let y = vec![1u8, 0u8];
+        model.fit(&x, &y);
+        assert!(
+            (model.weights[0] - 0.25).abs() < 1e-12,
+            "w = {}",
+            model.weights[0]
+        );
+        assert!(model.bias.abs() < 1e-12, "b = {}", model.bias);
+    }
+
+    #[test]
+    fn test_log_loss_known_value() {
+        // With w=0, b=0: predict_proba = sigmoid(0) = 0.5 for all samples.
+        // For any y: loss = -(y·ln(0.5) + (1−y)·ln(0.5)) = −ln(0.5) = ln(2).
+        // Average over samples = ln(2) ≈ 0.6931471805599453.
+        let model = BinaryLogisticRegression::new(1);
+        let x = vec![vec![1], vec![-1]];
+        let y = vec![1u8, 0u8];
+        let loss = model.log_loss(&x, &y);
+        assert!(
+            (loss - std::f64::consts::LN_2).abs() < 1e-12,
+            "loss = {}, expected ln(2)",
+            loss
+        );
+    }
+
+    // ── Edge-case coverage for real branches of logic ────────────────────
+
+    #[test]
+    fn test_binary_perfectly_separable() {
+        // Perfectly separable 1D data: x<0 → class 0, x>0 → class 1.
+        // With enough iterations the model should classify all correctly.
+        let x: Vec<Vec<i8>> = vec![vec![-1], vec![-1], vec![1], vec![1]];
+        let y: Vec<u8> = vec![0, 0, 1, 1];
+
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 2000,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        model.fit(&x, &y);
+        let acc = model.accuracy(&x, &y);
+        assert_eq!(
+            acc, 1.0,
+            "Perfectly separable data should reach 100% accuracy"
+        );
+        // On unseen points the decision boundary is still correct.
+        assert_eq!(model.predict(&[-1]), 0);
+        assert_eq!(model.predict(&[1]), 1);
+    }
+
+    #[test]
+    fn test_binary_all_same_class() {
+        // All samples are class 1 — the model should train without panicking
+        // and predict class 1 everywhere (bias grows positive).
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0]];
+        let y: Vec<u8> = vec![1, 1, 1];
+
+        let mut model = BinaryLogisticRegression::with_config(
+            1,
+            LogisticConfig {
+                learning_rate: 0.5,
+                max_iter: 500,
+                l2_penalty: 0.0,
+                tol: 0.0,
+            },
+        );
+        model.fit(&x, &y);
+        for xi in &x {
+            assert_eq!(model.predict(xi), 1, "Should predict class 1 for all");
+        }
+    }
+
+    #[test]
+    fn test_binary_single_sample() {
+        // Training on a single sample should not crash (n=1, no division issues).
+        let x: Vec<Vec<i8>> = vec![vec![1, 1]];
+        let y: Vec<u8> = vec![1];
+
+        let mut model = BinaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        let loss = model.log_loss(&x, &y);
+        assert!(loss.is_finite(), "Loss should be finite for single sample");
+    }
+
+    #[test]
+    fn test_ternary_all_same_class() {
+        // All samples are class 1 — should train without panicking.
+        let x: Vec<Vec<i8>> = vec![vec![1, 0], vec![-1, 1], vec![0, -1]];
+        let y: Vec<usize> = vec![1, 1, 1];
+
+        let mut model = TernaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        for xi in &x {
+            assert_eq!(model.predict(xi), 1, "Should predict class 1 for all");
+        }
+    }
+
+    #[test]
+    fn test_ternary_single_sample() {
+        // Single sample in multinomial — should not crash.
+        let x: Vec<Vec<i8>> = vec![vec![1, 1]];
+        let y: Vec<usize> = vec![2];
+
+        let mut model = TernaryLogisticRegression::new(2);
+        model.fit(&x, &y);
+        let loss = model.cross_entropy_loss(&x, &y);
+        assert!(loss.is_finite(), "Loss should be finite for single sample");
     }
 }
